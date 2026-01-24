@@ -44,11 +44,11 @@ GOOGLE_STT_LANG = os.getenv("GOOGLE_STT_LANG", "en-US")
 # =====================
 MODAL_LLM_URL = os.getenv(
     "MODAL_LLM_URL",
-        "https://noureldinaymanm--qwen-gemini-like-api-web-app.modal.run/v1beta/models/anything:generateContent",
+    "https://cgpt23336--qwen-gemini-like-api-web-app.modal.run/v1beta/models/anything:generateContent",
 )
 MODAL_LLM_HEALTH_URL = os.getenv(
     "MODAL_LLM_HEALTH_URL",
-    "https://noureldinaymanm--qwen-gemini-like-api-web-app.modal.run/health",
+    "https://cgpt23336--qwen-gemini-like-api-web-app.modal.run/health",
 )
 
 
@@ -57,7 +57,7 @@ GOOGLE_TTS_VOICE = os.getenv("GOOGLE_TTS_VOICE", "en-US-Standard-C")
 GOOGLE_TTS_SR = int(os.getenv("GOOGLE_TTS_SR", "24000"))
 
 CACHE_TTL_SEC = 600          # 10 minutes
-MIN_INTERVAL_SEC = 1.0       # throttle
+MIN_INTERVAL_SEC = 3.0       # throttle
 
 # UX line at the end of every answer
 CTA_LINE = "\n\n(Press 'A' to ask me anything else!)"
@@ -107,11 +107,13 @@ app.add_middleware(
 def create_session() -> requests.Session:
     session = requests.Session()
     retry_strategy = Retry(
-        total=3,
-        backoff_factor=0.4,
+        total=6,
+        backoff_factor=1.0,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET", "POST"],
+        respect_retry_after_header=True,
     )
+
     adapter = HTTPAdapter(
         max_retries=retry_strategy,
         pool_connections=20,
@@ -205,7 +207,7 @@ def build_voice_chat_prompt(bone: str, user_text: str) -> str:
 
 def build_quiz_prompt(bone: str) -> str:
     return (
-        f"Act as a medical examination expert. Generate a 5-question multiple-choice quiz on the anatomy of the {bone}.\n"
+        f"Act as a medical examination expert. Generate a 2-question multiple-choice quiz on the anatomy of the {bone}.\n"
         "Requirements:\n"
         "Each question must have exactly 4 options labeled A through D.\n"
         "The output must be strictly raw JSON format.\n"
@@ -264,47 +266,57 @@ class LoginRequest(BaseModel):
     password: str
 
 
+
 @app.post("/login")
 async def login(req: LoginRequest):
-    print(f"Login Attempt: {req.email}")
-    print(f"DEBUG: Password Received Length: {len(req.password)}") # <--- This will tell us the truth in the console
+    # Normalize email
+    email = (req.email or "").strip().lower()
+    raw_pw = req.password or ""
 
-    # 1. Select from the "users" table
-    query = users.select().where(users.c.email == req.email)
+    # bcrypt limit is 72 BYTES (not 72 chars)
+    pw_bytes = raw_pw.encode("utf-8", errors="ignore")
+    pw_bytes_72 = pw_bytes[:72]
+    safe_password = pw_bytes_72.decode("utf-8", errors="ignore")
+
+    print(f"Login Attempt: {email}")
+    print(
+        f"DEBUG: pw_chars={len(raw_pw)} "
+        f"pw_bytes={len(pw_bytes)} "
+        f"pw_bytes_trunc={len(pw_bytes_72)} "
+        f"safe_chars={len(safe_password)}"
+    )
+
+    # 1) fetch user
+    query = users.select().where(users.c.email == email)
     user = await database.fetch_one(query)
-    
-    # 2. IF USER NOT FOUND -> AUTO REGISTER
+
+    # 2) auto-register if not found
     if not user:
         print("User not found -> Creating new account...")
-        
-        # --- THE FIX: Force-truncate to 72 chars to prevent crash ---
-        safe_password = req.password[:72] 
-        
-        # Hash the safe password
-        hashed_pw = pwd_context.hash(safe_password)
-        
-        # Insert into "users" table
+
+        try:
+            hashed_pw = pwd_context.hash(safe_password)
+        except Exception as e:
+            print("Hash error:", repr(e))
+            raise HTTPException(status_code=500, detail="Password hashing failed")
+
         insert_query = users.insert().values(
-            email=req.email,
-            password=hashed_pw, 
+            email=email,
+            password=hashed_pw,
         )
         await database.execute(insert_query)
-        return {"ok": True, "msg": "Account created & logged in", "email": req.email}
 
-    # 3. IF USER FOUND -> VERIFY PASSWORD
+        return {"ok": True, "msg": "Account created & logged in", "email": email}
+
+    # 3) verify password
     stored_pw = user["password"]
-    
-    # Check A: Plain Text Match
-    if stored_pw == req.password:
-        return {"ok": True, "msg": "Login successful", "email": user["email"]}
 
-    # Check B: Hash Match
     try:
-        # We also truncate here just in case verify crashes on long inputs
-        if pwd_context.verify(req.password[:72], stored_pw):
+        if pwd_context.verify(safe_password, stored_pw):
             return {"ok": True, "msg": "Login successful", "email": user["email"]}
-    except Exception:
-        pass 
+    except Exception as e:
+        print("Password verify error:", repr(e))
+        raise HTTPException(status_code=500, detail="Password verification failed")
 
     print("Wrong password")
     raise HTTPException(status_code=401, detail="Incorrect password")
@@ -327,12 +339,13 @@ def gemini_generate_text(
     """
     global _last_request_time
 
+    # -------- cache --------
     if use_cache:
         cached = _cache_get(_text_cache, cache_key)
         if cached:
             return cached
 
-    # Throttle (sleep instead of throwing)
+    # -------- throttle (global) --------
     now = time.time()
     dt = now - _last_request_time
     if dt < MIN_INTERVAL_SEC:
@@ -347,26 +360,62 @@ def gemini_generate_text(
         },
     }
 
-    # Connect timeout 10s, read timeout 180s (prevents “hang forever” feeling)
-    r = _llm_session.post(MODAL_LLM_URL, json=payload, timeout=(10, 180))
+    # -------- retry/backoff --------
+    fallback_text = "I'm a bit busy right now (rate limit). Please try again in a few seconds."
+    max_attempts = 5
+    base_sleep = 1.5  # seconds
 
-    if r.status_code != 200:
-        raise RuntimeError(f"LLM HTTP {r.status_code}: {r.text}")
+    last_err = None
 
-    data = r.json()
+    for attempt in range(1, max_attempts + 1):
+        try:
+            r = _llm_session.post(MODAL_LLM_URL, json=payload, timeout=(10, 180))
 
+            # 429 = rate limit -> wait + retry
+            if r.status_code == 429:
+                retry_after = r.headers.get("Retry-After")
+                sleep_s = float(retry_after) if retry_after and retry_after.isdigit() else (base_sleep * attempt)
+                time.sleep(sleep_s)
+                continue
+
+            # any non-200 -> retry a bit then fallback
+            if r.status_code != 200:
+                last_err = RuntimeError(f"LLM HTTP {r.status_code}: {r.text[:800]}")
+                time.sleep(base_sleep * attempt)
+                continue
+
+            data = r.json()
+
+            try:
+                text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            except Exception:
+                last_err = RuntimeError(f"Bad LLM response shape: {str(data)[:800]}")
+                time.sleep(base_sleep * attempt)
+                continue
+
+            if not text:
+                last_err = RuntimeError("LLM returned empty text")
+                time.sleep(base_sleep * attempt)
+                continue
+
+            if use_cache:
+                _cache_set(_text_cache, cache_key, text)
+
+            return text
+
+        except Exception as e:
+            last_err = e
+            time.sleep(base_sleep * attempt)
+            continue
+
+    # -------- final fallback (do NOT crash VR endpoints) --------
+    # Optional: print last error for debugging
     try:
-        text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        print("LLM failed after retries:", repr(last_err))
     except Exception:
-        raise RuntimeError(f"Bad LLM response shape: {data}")
+        pass
 
-    if not text:
-        raise RuntimeError("LLM returned empty text")
-
-    if use_cache:
-        _cache_set(_text_cache, cache_key, text)
-
-    return text
+    return fallback_text
 
 # =====================
 # Google TTS (FIXED)
