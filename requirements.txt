@@ -4,6 +4,7 @@ requests
 python-dotenv
 sqlalchemy
 databases
-passlib
+passlib[bcrypt]
 asyncpg
 python-multipart
+
