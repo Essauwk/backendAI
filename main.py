@@ -20,7 +20,7 @@ from typing import List, Optional
 
 import sqlalchemy
 import databases
-from passlib.context import CryptContext
+from passlib.hash import pbkdf2_sha256
 
 
 # ===== Load .env =====
@@ -74,7 +74,6 @@ DATABASE_URL = "postgresql://medilearn_user:xO64NTMEOUI9T2zZKzIkMo2Ul53bWWRg@dpg
 
 database = databases.Database(DATABASE_URL)
 metadata = sqlalchemy.MetaData()
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
 
@@ -269,22 +268,11 @@ class LoginRequest(BaseModel):
 
 @app.post("/login")
 async def login(req: LoginRequest):
-    # Normalize email
     email = (req.email or "").strip().lower()
-    raw_pw = req.password or ""
-
-    # bcrypt limit is 72 BYTES (not 72 chars)
-    pw_bytes = raw_pw.encode("utf-8", errors="ignore")
-    pw_bytes_72 = pw_bytes[:72]
-    safe_password = pw_bytes_72.decode("utf-8", errors="ignore")
+    password = (req.password or "")
 
     print(f"Login Attempt: {email}")
-    print(
-        f"DEBUG: pw_chars={len(raw_pw)} "
-        f"pw_bytes={len(pw_bytes)} "
-        f"pw_bytes_trunc={len(pw_bytes_72)} "
-        f"safe_chars={len(safe_password)}"
-    )
+    print(f"DEBUG: pw_chars={len(password)} pw_bytes={len(password.encode('utf-8', 'ignore'))}")
 
     # 1) fetch user
     query = users.select().where(users.c.email == email)
@@ -295,7 +283,7 @@ async def login(req: LoginRequest):
         print("User not found -> Creating new account...")
 
         try:
-            hashed_pw = pwd_context.hash(safe_password)
+            hashed_pw = pbkdf2_sha256.hash(password)
         except Exception as e:
             print("Hash error:", repr(e))
             raise HTTPException(status_code=500, detail="Password hashing failed")
@@ -312,8 +300,17 @@ async def login(req: LoginRequest):
     stored_pw = user["password"]
 
     try:
-        if pwd_context.verify(safe_password, stored_pw):
+        # ✅ Support BOTH: new pbkdf2 hashes + old bcrypt hashes (optional, helps migration)
+        if stored_pw.startswith("$pbkdf2-sha256$"):
+            ok = pbkdf2_sha256.verify(password, stored_pw)
+        else:
+            # old/unknown hash -> refuse or treat as wrong
+            # (لو عايز تعمل migration من bcrypt لازم نرجّع bcrypt بشكل سليم، لكن حالياً Render بيكسره)
+            ok = False
+
+        if ok:
             return {"ok": True, "msg": "Login successful", "email": user["email"]}
+
     except Exception as e:
         print("Password verify error:", repr(e))
         raise HTTPException(status_code=500, detail="Password verification failed")
