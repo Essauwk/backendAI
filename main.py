@@ -70,8 +70,7 @@ CTA_LINE = "\n\n(Press 'A' to ask me anything else!)"
 
 
 # --- DATABASE CONFIG ---
-DATABASE_URL = os.getenv("DATABASE_URL")
-
+DATABASE_URL = "postgresql://medilearn_user:xO64NTMEOUI9T2zZKzIkMo2Ul53bWWRg@dpg-d3c2oremcj7s73d7d3h0-a.frankfurt-postgres.render.com/medilearn?ssl=require"
 
 database = databases.Database(DATABASE_URL)
 metadata = sqlalchemy.MetaData()
