@@ -42,13 +42,14 @@ GOOGLE_STT_LANG = os.getenv("GOOGLE_STT_LANG", "en-US")
 # =====================
 # Modal LLM
 # =====================
+
 MODAL_LLM_URL = os.getenv(
     "MODAL_LLM_URL",
-    "https://cgpt23336--qwen-gemini-like-api-web-app.modal.run/v1beta/models/anything:generateContent",
+    "https://essamahmoud04--qwen-gemini-like-api-web-app.modal.run /v1beta/models/anything:generateContent",
 )
 MODAL_LLM_HEALTH_URL = os.getenv(
     "MODAL_LLM_HEALTH_URL",
-    "https://cgpt23336--qwen-gemini-like-api-web-app.modal.run/health",
+    "https://essamahmoud04--qwen-gemini-like-api-web-app.modal.run/health",
 )
 
 
